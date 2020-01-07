@@ -1,0 +1,222 @@
+// Loading external scripts.
+var altering_IC_algorithms = require('users/albremoteforest/DontDelete:altering_IC_algorithms');
+
+
+// Function that automatically adapts the band_model to the available bands for a given multitemporal image.
+var automatic_band_model_adjust = function(func_mt_image, func_band_model1) {
+  var list_number_of_bands = ee.List.sequence(0, func_band_model1.length().subtract(1));
+  
+  // Analyse MT - image for classification regarding available bands.
+  var band_names = func_mt_image.bandNames();
+  var length_band_names = ee.Number(band_names.length());
+  var letzter_eintrag = ee.String(band_names.get(length_band_names.subtract(1)));
+  var index_ = letzter_eintrag.index("_");
+  
+  // Function that actually builds the custom band model.
+  var construct_band_model_custom = function(last_item, index_of_, func_bands) {
+    // Extracts the number of single images used in constructing the multitemporal image.
+    var einzelbilder = ee.Number.parse(letzter_eintrag.slice(index_.add(1), index_.add(2)));
+    var list_number_of_images = ee.List.sequence(1, einzelbilder);
+    // Prepare band_model to match bands of image for classification.
+    // Construct band names (band names for classification + _ + number of single pictures in multitemporal image.
+    var band_model1 = list_number_of_images.map(function(number) {
+      number = ee.Number(number).toInt();
+      number = ee.String(number);
+      var wrap = func_bands.map(function(band) {
+        band = ee.String(band);
+        var band_plus_number = band.cat("_").cat(number);
+        return band_plus_number;
+      });
+      return wrap;
+    });
+  
+    // Append all lists together.
+    var final_list = list_number_of_images.iterate(
+      function(instance, list) {
+        instance = ee.Number(instance).subtract(1);
+        list = ee.List(list);
+        var temp_list = list.add(band_model1.get(instance));
+        return temp_list;
+      }, 
+      ee.List(func_bands)
+    );
+    return ee.List(final_list).flatten();
+  };
+
+  // If-statement, activates function construct_band_model_custom only if a multitemporal image is in use.
+  // Otherwise original band_model is assumed. 
+  var band_model_custom = ee.Algorithms.If(
+    ee.Algorithms.IsEqual(index_, -1),
+    band_model_custom = func_band_model1,
+    band_model_custom = construct_band_model_custom(letzter_eintrag, index_, func_band_model1)
+  );
+  
+ return band_model_custom;
+};
+
+
+// Function that classifies one image, based on the training data passed to this function and a Random Forest.
+var classifyImage = function(func_image, func_training_samples, func_band_model) {
+  func_image = ee.Image(func_image);
+  func_training_samples = ee.FeatureCollection(func_training_samples);
+  var training_properties = func_training_samples.get('classification_feature');
+  var func_band_model_custom = automatic_band_model_adjust(func_image, func_band_model);
+  
+  // Sampling training data.
+  var training = func_image.select(func_band_model_custom).sampleRegions({
+    collection: func_training_samples, 
+    properties: [training_properties], 
+    scale: 10
+  });
+  
+  // Train classifier.
+  var classifier = ee.Classifier.randomForest(500, 0).train({
+    features: training,
+    classProperty: training_properties,
+    inputProperties: func_band_model_custom
+  });
+  
+  // Classify image.
+  var classified_image = func_image.select(func_band_model_custom).classify(classifier);
+  
+  // Explain you, classifier!
+  var clas_explain = classifier.explain();
+  
+  // Combine classified picture and explain into dictionary for return.
+  var dic_img_expl = ee.Dictionary({
+    'classified_image': classified_image,
+    'explanation': clas_explain
+  });
+  
+  return classified_image;
+  //return dic_img_expl;
+};
+
+
+// Function that classifies one image, based on the training data passed to this function and a Random Forest, 
+// but returns the probability of the classification.
+var classification_probability = function (func_image, func_training_samples, func_band_model) {
+  func_image = ee.Image(func_image);
+  func_training_samples = ee.FeatureCollection(func_training_samples);
+  var training_properties = func_training_samples.get('classification_feature');
+  var func_band_model_custom = automatic_band_model_adjust(func_image, func_band_model);
+  
+  // Sampling training data.
+  var training = func_image.select(func_band_model_custom).sampleRegions({
+    collection: func_training_samples, 
+    properties: [training_properties], 
+    scale: 10
+  });
+  
+  // Train classifier.
+  var classifier = ee.Classifier.randomForest(500, 0).setOutputMode('PROBABILITY').train({
+    features: training,
+    classProperty: training_properties,
+    inputProperties: func_band_model_custom
+  });
+  
+  // Classify image.
+  var classified_image = func_image.select(func_band_model_custom).classify(classifier);
+  
+  return classified_image;
+};
+
+
+// Function that takes a year, loads predefined images, combines them into one and classifies them in two steps.
+// First deciduous and coniferous, then ash, beech and mixed forest. This basic forest classification is used to compare 
+// single-date classifiactions with.
+var classifyForestMain = function(year, sample_data) {
+  year = ee.String(year);
+  sample_data = ee.Dictionary(sample_data);
+  var sample_data_classification_step_2 = ee.FeatureCollection(sample_data.get('dec_vs_con'));
+  var sample_data_classification_step_3 = ee.FeatureCollection(sample_data.get('ash_vs_beech'));
+  var bands_step_2 = ee.List(['B3', 'B4', 'B8']);
+  var bands_step_3 = ee.List(['B3', 'B4', 'B8']);  
+  var func_bands = ee.List(['B2', 'B3', 'B8', 'EVI', 'NDVI']);
+  var forest_mask = ee.Image('users/albremoteforest/forest_masks_2016---2019')
+  .select(ee.String('FM_').cat(year))
+  .focal_min({kernel: ee.Kernel.circle(1)}).focal_max({kernel: ee.Kernel.circle(1)});
+  
+  var combine_2_images = function(img1, img2) {
+    img1 = ee.Image(altering_IC_algorithms.adding_ndvi_evi(img1));
+    img2 = ee.Image(altering_IC_algorithms.adding_ndvi_evi(img2));
+    var combined_image = img1.addBands(img2);
+    return combined_image;
+  };
+  
+  // Loads 3 or 4 pictures per year and combines them to one picture.
+  var img_classify_step2 = ee.Algorithms.If(
+    ee.Algorithms.IsEqual(year, '2016'),
+    img_classify_step2 = combine_2_images(
+      ee.Image('COPERNICUS/S2/20160505T103032_20160505T103027_T32UNU'),
+      ee.Image('COPERNICUS/S2/20160823T103022_20160823T103332_T32UNU')),
+    img_classify_step2 = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(year, '2017'),
+      img_classify_step2 = combine_2_images(
+        ee.Image('COPERNICUS/S2_SR/20170517T102031_20170517T102352_T32UNU'),
+        ee.Image('COPERNICUS/S2_SR/20170626T102021_20170626T102321_T32UNU')),
+      img_classify_step2 = ee.Algorithms.If(
+        ee.Algorithms.IsEqual(year, '2018'),
+        img_classify_step2 = combine_2_images(
+          ee.Image('COPERNICUS/S2_SR/20180427T102019_20180427T102022_T32UNU'),
+          ee.Image('COPERNICUS/S2_SR/20180701T102021_20180701T102404_T32UNU')),
+        img_classify_step2 = ee.Algorithms.If(
+          ee.Algorithms.IsEqual(year, '2019'),
+          img_classify_step2 = combine_2_images(
+            ee.Image('COPERNICUS/S2_SR/20190517T102031_20190517T102508_T32UNU'),
+            ee.Image('COPERNICUS/S2_SR/20190629T103031_20190629T103537_T32UNU')),
+          img_classify_step2 = ee.Image([])
+        )
+      )
+    )  
+  );
+  img_classify_step2 = ee.Image(img_classify_step2).updateMask(forest_mask).set('year', year);
+
+  // Classify deciduous and coniferous forest without explain.
+  var img_classified_dec_con = classifyImage(img_classify_step2, sample_data_classification_step_2, bands_step_2)
+    .set('classification_step:', 'deciduous_vs_coniferous', 'year:', year);
+  // Calculate classification probability for above classification step (step2).
+  var img_classified_dec_con_prob = classification_probability(img_classify_step2, sample_data_classification_step_2, bands_step_2)
+    .set('classification_step:', 'deciduous_vs_coniferous_probability', 'year:', year);
+
+  // Classify deciduous and coniferous forest with explain.
+  //var img_classified_dec_con = classifyImage(img_classify_step2, sample_data_classification_step_2, bands_step_2);
+  
+  // Classify ash and beech trees within previously classified deciduous forest areas without explain.
+  var img_classify_step3 = img_classify_step2.updateMask(
+    img_classified_dec_con.remap([0, 1], [1, 0]));
+  var img_classified_ash_beech = classifyImage(img_classify_step3, sample_data_classification_step_3, bands_step_3)
+    .set('classification_step:', 'ash_vs_beech', 'year:', year);
+  // Calculate classificaction probability for above classification step (step_3).
+  var img_classified_ash_beech_prob = classification_probability(img_classify_step3, sample_data_classification_step_3, bands_step_3)
+    .set('classification_step:', 'ash_vs_beech_probability', 'year:', year);
+  
+  // Classify ash and beech trees within previously classified deciduous forest areas with explain.
+  //var img_classified_dec_con_img = ee.Image(img_classified_dec_con.get('classified_image'));
+  //var img_classify_step3 = img_classify_step2.updateMask(
+  //  img_classified_dec_con_img.remap([0, 1], [1 ,0]));
+  //var img_classified_ash_beech = classifyImage(img_classify_step3, sample_data_classification_step_3, bands_step_3);
+  
+  // Combine classification results into dictionary for returning, without explain.
+  var classification_step_2_and_3 = ee.Dictionary({
+    'classification_step_2_classification': ee.Image(img_classified_dec_con),
+    'classification_step_2_probability': ee.Image(img_classified_dec_con_prob),
+    'classification_step_3_classification': ee.Image(img_classified_ash_beech),
+    'classification_step_3_probability': ee.Image(img_classified_ash_beech_prob)
+  });
+  
+  // Combine classification results into dictionary for returning, with explain.
+  //var classification_step_2_step_3 = ee.Dictionary({
+  //  'classification_step_2': ee.Dictionary(img_classified_dec_con),
+  //  'classification_step_3': ee.Dictionary(img_classified_ash_beech)
+  //});
+  
+  
+  //return ee.Image(img_classified_ash_beech.get('classified_image'));  
+  return classification_step_2_and_3;
+};
+
+exports.automatic_band_model_adjust = automatic_band_model_adjust;
+exports.classifyImage = classifyImage;
+exports.classification_probability = classification_probability;
+exports.classifyForestMain = classifyForestMain;
