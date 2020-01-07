@@ -1,0 +1,122 @@
+// Function that maps through a list with species names, loads the affiliated shapefile assets and constructs points 
+// inside these sample data polygons at the the center of a pixel.
+var constructSampleDataPoints = function(list_species) {
+  var selectSampleData = list_species.map(function(species) {
+    // Chose sample data polygon, based on the given list-species.
+    var polygon_species = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(species, 'deciduous'), 
+      polygon_species = ee.FeatureCollection('users/albremoteforest/merged_CH_laubwald_prop')
+      .set('species_name', 'deciduous', 'species', 0),
+      polygon_species = ee.Algorithms.If(
+        ee.Algorithms.IsEqual(species, 'coniferous'), 
+        polygon_species = ee.FeatureCollection('users/albremoteforest/merged_CH_nadelwald_prop')
+        .set('species_name', 'coniferous', 'species', 1),
+        polygon_species = ee.Algorithms.If(
+          ee.Algorithms.IsEqual(species, 'ash'), 
+          polygon_species = ee.FeatureCollection('users/albremoteforest/merged_CH_esche_prop')
+          .set('species_name', 'ash_healthy', 'species', 0),
+          polygon_species = ee.Algorithms.If(
+            ee.Algorithms.IsEqual(species, 'beech'), 
+            polygon_species = ee.FeatureCollection('users/albremoteforest/merged_CH_buche_prop')
+            .set('species_name', 'beech_healthy', 'species', 1),
+            polygon_species = ee.Algorithms.If(
+              ee.Algorithms.IsEqual(species, 'mixedDeciduous'),
+              polygon_species = ee.FeatureCollection('users/albremoteforest/merged_CH_mixedDeciduous_prop')
+              .set('species_name', 'mixed_deciduous_healthy', 'species', 2),
+              polygon_species = ee.FeatureCollection([])
+            )
+          )
+        )
+      )
+    );
+    
+    // Generating points inside sample data polygons.
+    var dummy_image = ee.Image('COPERNICUS/S2/20160912T103022_20160912T103551_T32UNU');
+    var coords_image = ee.Image.pixelLonLat().reproject(dummy_image.select('B3').projection()).clip(polygon_species);
+    var coords_list = coords_image.reduceRegion({
+      reducer: ee.Reducer.toList(2),
+      geometry: ee.FeatureCollection(polygon_species).geometry()
+    }).values().get(0);
+    coords_list = ee.List(coords_list);
+    var coords_points = coords_list.map(function(xy) {
+      var geom = ee.Algorithms.GeometryConstructors.Point(xy);
+      return ee.Feature(geom, {}).copyProperties(polygon_species);
+    });
+    //coords_points = ee.FeatureCollection(coords_points).set({'sample_data': species}); 
+    coords_points = ee.FeatureCollection(coords_points).copyProperties(polygon_species); 
+    return coords_points;  
+  });
+  return selectSampleData;
+};
+
+
+// Function that maps through a list with species names and loads the affiliated shapefile point assets.
+var loadSampleDataPoints = function(list_species) {
+  var selectSample = list_species.map(function(species) {
+    var points_species = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(species, 'buche_pilz'),
+      points_species = ee.FeatureCollection('users/albremoteforest/Buche_pilzbefall'),
+      points_species = ee.Algorithms.If(
+        ee.Algorithms.IsEqual(species, 'buche_insekt'), 
+        points_species = ee.FeatureCollection('users/albremoteforest/Buche_insektenbefall'),  
+        points_species = ee.Algorithms.If(
+          ee.Algorithms.IsEqual(species, 'buche_vitalitaet_3'), 
+          points_species = ee.FeatureCollection('users/albremoteforest/Buche_vitalitaet_3'),
+          points_species = ee.Algorithms.If(
+            ee.Algorithms.IsEqual(species, 'esche_pilz'),
+            points_species = ee.FeatureCollection('users/albremoteforest/Esche_pilzbefall'),
+            points_species = ee.Algorithms.If(
+              ee.Algorithms.IsEqual(species, 'esche_insekt'), 
+              points_species = ee.FeatureCollection('users/albremoteforest/Esche_insektenbefall'),  
+              points_species = ee.Algorithms.If(
+                ee.Algorithms.IsEqual(species, 'esche_vitalitaet_3'), 
+                points_species = ee.FeatureCollection('users/albremoteforest/Esche_vitalitaet_3'),
+                points_species = ee.FeatureCollection([])))))));
+    points_species = ee.FeatureCollection(points_species).set({'sample_data': species});
+    return points_species;
+  });
+  return selectSample;
+};
+
+
+// Function that extracts pixel values at point geometries.
+var extractValuesAtPoints = function(list_with_points, image_collection, cloud_mask) {
+  //Used items.
+  list_with_points = ee.List(list_with_points);
+  image_collection = ee.ImageCollection(image_collection);
+  cloud_mask = ee.Image(cloud_mask);
+  // Nested mapping through species and image collection.
+  var wrap = list_with_points.map(function(point_feature) {
+    point_feature = ee.FeatureCollection(point_feature);
+    var wrapWrap = image_collection.map(function(image_i) {
+      image_i = ee.Image(image_i);
+      // Select the cloud mask for used image and mask that image.
+      var image_date = ee.Date(image_i.get('system:time_start')).format('YYYY-MM-dd').replace('-','','g');
+      var cm_band_names = cloud_mask.bandNames();
+      var list = cm_band_names.map(function(instance) {
+        return ee.String(instance).rindex(image_date);
+      });
+      var right_cm = list.indexOf(19);
+      var matched_cm_string = ee.String(cm_band_names.get(right_cm));
+      var mask = ee.Image(cloud_mask.select(matched_cm_string)).unmask().remap([0, 1], [1, 0]);
+      image_i = image_i.updateMask(mask);
+      var reflectance_values = function(func_image_i) {
+        var value = func_image_i.sample({
+          region: point_feature,
+          scale: 10,
+          dropNulls: false
+        });
+        return value;
+      };
+      return reflectance_values(image_i);
+    });
+    return wrapWrap;
+  });
+  return wrap;  
+};
+
+
+// Exports.
+exports.constructSampleDataPoints = constructSampleDataPoints;
+exports.loadSampleDataPoints = loadSampleDataPoints;
+exports.extractValuesAtPoints = extractValuesAtPoints;
