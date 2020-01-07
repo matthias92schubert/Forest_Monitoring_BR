@@ -1,0 +1,675 @@
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////                                           Pre-Proccessing.                                           ////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Load all external scripts, shapefiles and everything else.
+// Externral scripts.
+var cloud_mask_algorithms = require('users/albremoteforest/DontDelete:cloud_mask_algorithms');
+var value_extraction_algorithms = require('users/albremoteforest/DontDelete:value_extraction_algorithms_new');
+var altering_IC_algorithms = require('users/albremoteforest/DontDelete:altering_IC_algorithms');
+var classification_algorithms = require('users/albremoteforest/DontDelete:classification_algorithms');
+var forest_masks_algorithms = require('users/albremoteforest/DontDelete:forest_masks_algorithms');
+var monitoring_algorithms = require('users/albremoteforest/DontDelete:monitoring_algorithms');
+
+// Variables used throughout the whole script. 
+var pfl = ee.Number(1);        // picture from list
+
+// Shapefiles.
+var studyArea = ee.FeatureCollection('users/albremoteforest/grenzen_rough_WGS1984');
+var convexHull = ee.FeatureCollection('users/albremoteforest/SP201602_E_2016_CH_WGS1984');
+
+// Select the year
+var years = ee.List([
+  ['2016-01-01', '2016-12-31'],       // 0  2016
+  ['2017-01-01', '2017-12-31'],       // 1  2017
+  ['2017-03-28', '2017-12-31'],       // 2  2017_SR
+  ['2018-01-01', '2018-12-31'],       // 3  2018_SR
+  ['2019-01-01', '2019-10-25']        // 4  2019_SR
+]);    
+// Use this start and end date variables when calculating complete products (e.g. cloud masks, main forest classification).
+var filterDateStart = ee.List(years.get(3)).get(0);
+var filterDateEnd = ee.List(years.get(3)).get(1);
+// Use this start and end date variables when activating monitoring step.
+var filterDateStart = ('2018-05-24');
+var filterDateEnd = ('2018-06-03');
+
+// Image Collections.
+// Year 20XX, without doubles.
+var se2col201x_all = ee.ImageCollection('COPERNICUS/S2_SR')
+.filterDate(filterDateStart, filterDateEnd)
+.filterBounds(convexHull)
+.sort('system:time_start');
+var se2col201x_unique1 = se2col201x_all.iterate(
+  cloud_mask_algorithms.getRidOfDoubles, 
+  ee.List([ee.Image(0).set('system:time_start', 0, 'repetition?', 1)]));
+var se2col201x_unique2 = ee.List(se2col201x_unique1).filter(ee.Filter.neq('repetition?', 1));
+var se2col201x = ee.ImageCollection(se2col201x_unique2);
+var se2col201xList = se2col201x.toList(se2col201x.size());
+var imageFromSe2col201xList = ee.Image(se2col201xList.get(pfl));
+// Year 20XX, with additional information.
+// Added Vegetation Indices.
+var se2col201x_veggie = se2col201x.map(altering_IC_algorithms.adding_ndvi_evi);
+var se2col201x_veggieList = se2col201x_veggie.toList(se2col201x_veggie.size());
+var imageFromSe2col201x_veggieList = ee.Image(se2col201x_veggieList.get(pfl));
+print('used image collection', se2col201x_veggie);
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////                                          Customize Script.                                           ////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Turn on/off certain precessing steps.
+
+// Decide whether cloud masks should be computed or not,
+// if yes, computeCloudMask = true, if not, computeCloudMask = false.
+// Cloud masks are computed for each image in se2col201x.
+var computeCloudMask = false;
+
+// Chose wether you have 'polygons' or 'points' as sample data, and whether you want to export the sampled
+// data as csv to your Google Drive Account.
+var do_value_extraction = false;
+var sample_data_type = 'polygons'; 
+//var extract_values_of = ee.List(['deciduous', 'coniferous']);
+var extract_values_of = ee.List(['ash', 'beech', 'mixedDeciduous']);
+// Change number in variable 'number_in_get' to chose which species you want to access. Numbers refer 
+// to the species names in the species_list_polygons or species_list_points variable. 
+// As of 01.01.2020: 
+// 0 = deciduous, 1 = coniferous (for first variable species_list_polygons)
+// 0 = ash, 1 = beech, 2 = mixedDeciduous (for second variable species_list_polygons)
+var number_in_get = ee.Number(0);
+var export_csv = false;
+// Further parameters can to be set inside Value Extraction section.
+
+// Decide whether forest masks should be computed or not,
+// if yes, computeForestMask = true, if not, computeForestMask = false. 
+// listYears = years for which forest mask should be computed.
+var computeForestMasks = false;
+var export_forest_masks = false;
+var listYears = ee.List(['2016', '2017', '2018', '2019']);
+
+// Decide whether classification step 2 and 3 should be executed or not,
+// if yes, furtherClassification = true, if not, furtherClassification = false. 
+// year = year for which classification should be computed.
+var furtherClassification = false;
+var exportFurtherClassification = false;
+var year = '2018';
+
+// Define monitoring step.
+// Chose whether monitoring should be carried out or not,
+// if yes, doMonitoring = true, if not, doMonitoring = false.
+var doMonitoring = true;
+var image_from_IC = 0;
+var band_to_display = 0;
+var collection_for_monitoring = ee.FeatureCollection(se2col201x_veggie)
+.filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 85));
+print('used image collection for monitoring', collection_for_monitoring);
+var band_model_for_monitoring = ee.List(['B4', 'B8', 'EVI']);
+var class_for_monitoring = 'deciduous';
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////                                      Preparing Ground Truth Data.                                    ////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Load Ground Truth Data.
+// For classification step 2 (deciduous vs. coniferous).
+var polygonDeciduous = ee.FeatureCollection(
+  'users/albremoteforest/merged_CH_laubwald_prop').set('species', 'deciduous');
+var polygonConiferous = ee.FeatureCollection(
+  'users/albremoteforest/merged_CH_nadelwald_prop').set('species', 'coniferous');
+var sampleData_dec_vs_con = polygonDeciduous.merge(polygonConiferous)
+  .set('classification_feature', 'species');
+
+// For classification step 3 (ash vs. beech vs. mixed deciduous).
+var polygon_ash_healthy = ee.FeatureCollection(
+  'users/albremoteforest/merged_CH_esche_prop').set('species', 'ash_healthy');
+var polygon_beech_healthy = ee.FeatureCollection(
+  'users/albremoteforest/merged_CH_buche_prop').set('species', 'beech_healthy');
+var polygonMixedDeciduous = ee.FeatureCollection(
+  'users/albremoteforest/merged_CH_mixedDeciduous_prop').set('species', 'mixed_deciduous_healthy');  
+var sampleData_ash_vs_beech = polygon_ash_healthy.merge(polygon_beech_healthy).merge(polygonMixedDeciduous)
+  .set('classification_feature', 'species');
+
+var combined_sample_polygons = ee.Dictionary({
+  'dec_vs_con': sampleData_dec_vs_con,
+  'ash_vs_beech': sampleData_ash_vs_beech
+});
+
+
+// Load equalized polygon ground truth data.
+// Classificatio step 2.
+var polygonDeciduous_shortened = altering_IC_algorithms.shorten_FC(polygonDeciduous, 17);
+var sampleData_dec_vs_con_shortened = polygonDeciduous_shortened.merge(polygonConiferous)
+  .set('classification_feature', 'species');
+// Classification step 3.
+var polygon_beech_healthy_shortened = altering_IC_algorithms.shorten_FC(polygon_beech_healthy, 15);
+var polygonMixedDeciduous_shortened = altering_IC_algorithms.shorten_FC(polygonMixedDeciduous, 15);
+var sampleData_ash_vs_beech_shortened = polygon_ash_healthy.merge(polygon_beech_healthy_shortened)
+.merge(polygonMixedDeciduous_shortened).set('classification_feature', 'species');
+
+var combined_sample_polygons_shortened = ee.Dictionary({
+  'dec_vs_con': sampleData_dec_vs_con_shortened,
+  'ash_vs_beech': sampleData_ash_vs_beech
+});
+
+
+// Load equalized point ground truth data.
+var listClasses1 = ee.List(['deciduous', 'coniferous']);
+var listClasses2 = ee.List(['ash', 'beech', 'mixedDeciduous']);
+// Classification step 2.
+var samplepoints1 = value_extraction_algorithms.constructSampleDataPoints(listClasses1);
+var samplepoints1_1 = ee.FeatureCollection(samplepoints1.get(0));
+var samplepoints1_2 = ee.FeatureCollection(samplepoints1.get(1));
+// Classification step 3.
+var samplepoints2 = value_extraction_algorithms.constructSampleDataPoints(listClasses2);
+var samplepoints2_1 = ee.FeatureCollection(samplepoints2.get(0));
+var samplepoints2_2 = ee.FeatureCollection(samplepoints2.get(1));
+var samplepoints2_3 = ee.FeatureCollection(samplepoints2.get(2));
+// Shorten deciduous, beech and mixed deciduous classes.
+var samplepoints1_1_shortened = altering_IC_algorithms.shorten_FC(samplepoints1_1, 45);
+var samplepoints2_2_shortened = altering_IC_algorithms.shorten_FC(samplepoints2_2, 40);
+var samplepoints2_3_shortened = altering_IC_algorithms.shorten_FC(samplepoints2_3, 40);
+
+var sampleData_dec_vs_con_shortened1 = samplepoints1_1_shortened.merge(samplepoints1_2)
+.set('classification_feature', 'species');
+var sampleData_ash_vs_beech_shortened1 = samplepoints2_1
+.merge(samplepoints2_2_shortened).merge(samplepoints2_3_shortened)
+.set('classification_feature', 'species');
+
+var combined_sample_polygons_shortened1 = ee.Dictionary({
+  'dec_vs_con': sampleData_dec_vs_con_shortened1,
+  'ash_vs_beech': sampleData_ash_vs_beech_shortened1
+});
+
+
+// Select data for monitoring based on variable class_for_monitoring.
+var sample_data_for_monitoring = ee.Algorithms.If(
+  ee.Algorithms.IsEqual(class_for_monitoring, 'deciduous'),
+  sample_data_for_monitoring = polygonDeciduous,
+  ee.Algorithms.If(
+    ee.Algorithms.IsEqual(class_for_monitoring = 'coniferous'),
+    sample_data_for_monitoring = polygonConiferous,
+    sample_data_for_monitoring = ee.String(
+      'Chose either "deciduous" or "coniferous" for variable "sample_data_for_monitoring"')
+  )
+);
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////                                       Cloud masking section.                                         ////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Create Cloud Masks.
+var computeAndCreateCloudMask = function(image_collection) {
+  // Function to prepare the image collection to be mapped over cloud detection functions. Results in an 
+  // ee.List with ee.Dictionaries for each element in the image collection. Each dictionary has three entries: 
+  // the Image from the IC, an area of interest (almost useless), and the study area (boundaries of the 
+  // Biosphärengebiet).
+  var constructDicCloudMasking = function(func_image, list) {
+    var dic_image = ee.Image(func_image);
+    var dic_area_of_interest = ee.FeatureCollection('users/albremoteforest/SP201602_E_2016_CH_WGS1984');
+    var dic_clipping_geometry = ee.FeatureCollection('users/albremoteforest/grenzen_rough_WGS1984');
+    var dic_dic = ee.Dictionary({
+      dic_image: dic_image,
+      dic_area_of_interest: dic_area_of_interest,
+      dic_clipping_geometry: dic_clipping_geometry
+    });
+    return ee.List(list).add(dic_dic);
+  };
+  var se2col201xplusStuff = ee.List(image_collection.iterate(
+    constructDicCloudMasking, ee.List([ee.Dictionary({})])));
+  se2col201xplusStuff = se2col201xplusStuff.slice(1, se2col201xplusStuff.length());
+
+  // Actual cloud mask (list with cloud mask for each image in image collection).
+  var se2col201xcloudMask = se2col201xplusStuff.map(cloud_mask_algorithms.constructCloudMask);
+  var imageFromSe2col201xcloudMask = ee.Image(se2col201xcloudMask.get(pfl));
+
+  // In order to save the computed cloud masks for later, the list with cloud masks is transformed into an 
+  // ee.Image and automatically exported to an Earth Engine Asset.
+  // Cloud masks of each individual day are saved as a different layer in that image. These layers are then 
+  // renamed after the image id of the image, on which the cloud mask has been computed.
+  var cloudMasksImage = ee.Image(se2col201xcloudMask.iterate(
+    cloud_mask_algorithms.cloudMasks2Image, 
+    ee.Image([])));
+
+  // Export the cloud mask directly to an Earth Engine table asset.
+  Export.image.toAsset({
+    image: cloudMasksImage,
+    description: 'image_with_cloud_masks_export_to_asset',
+    assetId: 'cloud_masks_' +filterDateStart.getInfo()+ '---' +filterDateEnd.getInfo(),
+    region: studyArea,
+    scale: 10
+  });
+};
+
+if (computeCloudMask === true) {
+  computeAndCreateCloudMask(se2col201x);
+  print('new cloud masks have been computed');
+} else if (computeCloudMask === false) {
+  print('no cloud masks have been computed');
+} else {
+  print("chose either true or false for variable computeCloudMask");
+}
+  
+// Load pre-computed cloud masks.
+var cloudMasks = ee.Image(ee.Algorithms.If(
+  ee.Algorithms.IsEqual(ee.String(ee.Date(filterDateStart).format('YYYY')), '2016'),
+  cloudMasks = ee.Image('users/albremoteforest/cloud_masks_2016-01-01---2016-12-31'),
+  cloudMasks = ee.Algorithms.If(
+    ee.Algorithms.IsEqual(ee.String(ee.Date(filterDateStart).format('YYYY')), '2017'),
+    cloudMasks = ee.Image('users/albremoteforest/cloud_masks_2017-01-01---2017-12-31'),
+    cloudMasks = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(ee.String(ee.Date(filterDateStart).format('YYYY')), '2018'),
+      cloudMasks = ee.Image('users/albremoteforest/cloud_masks_2018-01-01---2018-12-31'),
+      cloudMasks = ee.Algorithms.If(
+        ee.Algorithms.IsEqual(ee.String(ee.Date(filterDateStart).format('YYYY')), '2019'),
+        cloudMasks = ee.Image('users/albremoteforest/cloud_masks_2019-01-01---2019-10-25'),
+        cloudMasks = ee.String('no cloud mask loaded from assets')
+      )
+    )
+  )
+));
+print('loaded cloud mask from asset', cloudMasks);
+
+// Check whether pre-computed cloud mask is identical with used IC.
+var layersInCM = cloudMasks.bandNames();
+var imagesInIC = se2col201xList.map(function(img) {
+  return ee.String(ee.String('CM_').cat(ee.String(ee.Image(img).id())))});
+var zippedLists = layersInCM.zip(imagesInIC);
+var is_equal = zippedLists.map(function(instance) {
+  instance = ee.List(instance);
+  var compare1 = instance.get(0);
+  var compare2 = instance.get(1);
+  var marker = ee.Algorithms.If(
+    ee.Algorithms.IsEqual(compare1, compare2), ee.String('is_equal'), ee.String('is_not_equal'));  
+  return marker;
+});
+var combinedList = zippedLists.zip(is_equal);
+//print('check if CM belongs to scene', combinedList);
+var warning = ee.Algorithms.If(
+  is_equal.contains('is_not_equal'),
+  warning = ee.String('Attention, not all images match cm-layers'),
+  warning = ee.String('all images are found in cm-image')
+);
+print(warning);
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////                                     Value Extraction Section.                                        ////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Function to prepare the image collection to be mapped over value extraction functions. Results in an 
+// ee.List with ee.Dictionaries for each element in the image collection. Each dictionary has two entries: 
+// the Image from the IC, and the polygon, inside which the functions should be applied. 
+if (do_value_extraction === true) {
+  var species_list_polygons = extract_values_of;
+  //var species_list_points = ee.List(['esche_pilz', 'esche_insekt', 'esche_vitalitaet_3']);
+  var bands_model = ee.List(
+    ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B10', 'B11', 'B12', 'NDVI', 'EVI']);
+
+  if (sample_data_type === 'polygons') {
+    // Function that creates points inside the sample data polygons at the center of each pixel.
+    var pointsInPolygons = value_extraction_algorithms.constructSampleDataPoints(species_list_polygons);
+    print('data will be sampled at points created in user-defined polygons');
+    print('points in polygons used for value extraction', pointsInPolygons);
+  } else if (sample_data_type === 'points') {
+    // Function that loads specific assets, if sample data are already points.
+    var pointsInPolygons = value_extraction_algorithms.loadSampleDataPoints(species_list_points);
+    print('data will be sampled at user-defined points');
+    print('points in polygons used for value extraction', pointsInPolygons);
+  } else {
+    print("chose either 'polygons' or 'points' for variable sample_data_type");
+  }
+
+  // Function that takes reflectance values at each point in pointsInPolygons.
+  var reflectanceValues = value_extraction_algorithms.extractValuesAtPoints(
+    pointsInPolygons, se2col201x_veggie, cloudMasks);
+  print('reflectance values for all species', reflectanceValues);
+  // Change number in variable 'number_in_get' to chose which species you want to access. Numbers refer 
+  // to the species names in the species_list_polygons or species_list_points variable. 
+  // As of 01.01.2020: 
+  // 0 = deciduous, 1 = coniferous (for first variable species_list_polygons)
+  // 0 = ash, 1 = beech, 2 = mixedDeciduous (for second variable species_list_polygons)
+  var reflectanceValues1 = ee.FeatureCollection(reflectanceValues.get(number_in_get));
+  print('reflectance values for one species (eg. ash or beech)', reflectanceValues1);
+  print('values have been extracted');
+  
+  if (export_csv === true) {
+    Export.table.toDrive({
+      collection: reflectanceValues1.flatten(),
+      folder: 'reflectanceValues',
+      fileNamePrefix: 'refl_Values_' + species_list_polygons.get(number_in_get).getInfo() +
+      '_' + filterDateStart.getInfo()+ '---' +filterDateEnd.getInfo()
+    });
+    print('sampled data has been exported');
+  } else if (export_csv === false) {
+    print('no exports of sampled data');
+  } else {
+    print("chose either true or false for variable do_export");
+  }
+  
+} else if (do_value_extraction === false) {
+  print('values have not been extracted');
+} else {
+  print('chose either true or false for variable do_value_extraction');
+}
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////                                      Classification Section.                                         ////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// First step.
+// General classification of forest.
+// Create a forest mask. All scenes with zero cloud cover from one year are combined into one picture (median)
+// and a RF classifier is used to distinguish forest from other land cover. Sample data is drawn by hand and 
+// on optical features. 
+var createForestMasks = function(years) {
+  var forestMasks_median = ee.ImageCollection(ee.List(
+    years.iterate(forest_masks_algorithms.forestMask_medianPicture, ee.List([]))));
+  //print('IC with median forest masks', forestMasks_median);
+  var forestMasks_median_list = forestMasks_median.toList(forestMasks_median.size());
+
+  var forestMasks_classification = forestMasks_median.map(forest_masks_algorithms.forestMask_classification);
+  //print('IC with classified forest masks', forestMasks_classification);
+  var forestMasks_classification_list = forestMasks_classification.toList(forestMasks_classification.size());
+  //print('IC with classified forest masks, list', forestMasks_classification_list);
+  
+  var forestMasksImage = ee.Image(forestMasks_classification.iterate(
+    forest_masks_algorithms.forestMasks2Image, 
+    ee.Image([])));
+  //print('Image with forest masks as bands', forestMasksImage);
+  
+  var forestMasks_difference = ee.List(
+    forest_masks_algorithms.forestMask_difference(forestMasks_classification));
+  //print('List with difference between forest masks', forestMasks_difference);
+  
+  // Export computed forest masks as image with forest masks as bands.
+  if (export_forest_masks === true) {
+    var asset_ID = ee.String('users/albremoteforest/forest_masks_'+
+    listYears.get(0).getInfo()+'---'+listYears.get(listYears.size().subtract(1)).getInfo());
+    Export.image.toAsset({
+    image: forestMasksImage,
+    description: 'exports_forestMasksImage_to_asset',
+    scale: 10,
+    region: studyArea,
+    assetId: 'users/albremoteforest/forest_masks_'+
+    listYears.get(0).getInfo()+'---'+listYears.get(listYears.size().subtract(1)).getInfo()
+    });
+    print('forest masks have been exported to asset:', asset_ID);
+  } else if (export_forest_masks === false) {
+    print('no forest masks have been exported');
+  } else {
+    print("chose either true or false for variable export_forest_masks");
+  }
+  
+  return ee.Dictionary({
+    'forest_masks_median': forestMasks_median_list,
+    'forest_masks_difference': forestMasks_difference
+  });
+};
+
+
+if (computeForestMasks === true) {
+  var forest_masks = createForestMasks(listYears);
+  print('forest masks etc. have been computed', forest_masks);
+  var FM_median = forest_masks.get('forest_masks_median');
+  var FM_difference = forest_masks.get('forest_masks_difference');
+  //print(FM_median, FM_difference);
+} else if (computeCloudMask === false) {
+  print('no forest masks have been computed');
+} else {
+  print("chose either true or false for variable computeForestMask");
+}
+var FM_classification = ee.Image('users/albremoteforest/forest_masks_2016---2019');
+
+
+  
+// Second and third step --> main forest classification per year.
+// Multitemporal classification of deciduous or coniferous forest. After that, classification of ash and beech. 
+// Additional classification probability gets returned as well.
+if (furtherClassification === true) {
+  print('step 2 and step 3 classification have been carried out');
+  // Classification of main forest per year. All sample data is sent to this function via an ee.Dictionary. 
+  // Gets extracted and sorted inside the following function for the respective classification task.
+  var classification_step2_step3 = classification_algorithms.classifyForestMain(
+    year, combined_sample_polygons_shortened);
+  print('return from classifyMainForest', classification_step2_step3);
+  // Separate classification step 2 and step 3 from returned dictionary.
+  var step_2_classification = ee.Image(classification_step2_step3.get('classification_step_2_classification'));
+  print('step_2_classification', step_2_classification);
+  var step_2_probability = ee.Image(classification_step2_step3.get('classification_step_2_probability')).int32();
+  print('step_2_probability', step_2_probability);
+  var step_3_classification = ee.Image(classification_step2_step3.get('classification_step_3_classification'));
+  print('step_3_classification', step_3_classification);
+  var step_3_probability = ee.Image(classification_step2_step3.get('classification_step_3_probability')).int32();
+  print('step_3_probability', step_3_probability);
+  
+  
+  // Combine classification images into one image.
+  var mainForest = ee.Image([]).addBands(
+    step_2_classification.select([0], ['classification_step_2_classification']).addBands(
+      step_2_probability.select([0], ['classification_step_2_probability']).addBands(
+        step_3_classification.select([0], ['classification_step_3_classification'])
+      )  
+    )
+  );
+  print('mainForest', mainForest);
+
+  if (exportFurtherClassification === true) {
+    print('further classification steps have been exported to asset');
+    Export.image.toAsset({
+    image: mainForest,
+    description: 'exports_furtherClassification_to_asset',
+    scale: 10,
+    region: studyArea,
+    assetId: 'users/albremoteforest/main_forest_'+year
+    });
+  } else if (exportFurtherClassification === false) {
+    print('further classification steps have not been exported to asset');
+  } else {
+    print('chose either "true" or "false" for variable exportFurtherClassification');
+  }
+} else if (furtherClassification === false) {
+  print('no step 2 and 3 classification were carried out');
+} else {
+  print('chose either "true" or "false" for variable furtherClassification');
+}
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////                                        Monitoring Section.                                           ////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Calculate deviation between all pixels belonging to one class and the mean of the sampled reflectance
+// values belonging to one class for every timestep.
+
+if (doMonitoring === true) {
+  var deviation = monitoring_algorithms.mean_value_comparison(
+    collection_for_monitoring, 
+    sampleData_dec_vs_con, 
+    band_model_for_monitoring, 
+    class_for_monitoring);
+  print('monitoring has been activated');
+  print('deviation image', deviation);
+} else if (doMonitoring === false) {
+  print('monitoring has not been activated');
+} else {
+  print('chose either "true" or "false" for variable doMonitoring');
+}
+
+var monitoring_step_deviation = ee.Image(ee.List(deviation).get(image_from_IC)).select(band_to_display);
+var monitoring_step_image = ee.Image(ee.List(collection_for_monitoring.toList(collection_for_monitoring.size()).get(image_from_IC)))
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////                                         Accuracy Section.                                            ////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// 10-fold cross validation. 
+// See external script. Not my work, only adjusted to my data and slightly extended. Credits to Devin Routh.
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////                                         Printing Section.                                            ////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Pre-Proccessing.
+//print('inventory data SP201601_E_2016', SP201601);
+//print('image collection 2016, all images', se2col201x_all);
+//print('list, image collection 201x, without doubles', se2col201x_unique2);
+//print('image collection 201x, without doubles', se2col201x);
+//print('list, image collection 2016, without doubles', se2col201xList);
+//print('image with clouds', imageFromSe2col201xList);
+//print('image collection 201x, without doubles, with veggies', se2col201x_veggie);
+//print('list, image collection 201x, without doubles, with veggies', se2col201x_veggieList);
+//print('image with clouds + veggies', imageFromSe2col201x_veggieList);
+
+// Preparing Ground Truth Data.
+// All sample data as polygon-FeatureCollection.
+//print('sample polygon deciduous', polygonDeciduous);
+//print('sample polygon coniferous', polygonConiferous);
+//print('sample polygon ash', polygon_ash_healthy);
+//print('sample polygon beech', polygon_beech_healthy);
+//print('sample polygon mixed deciduous', polygonMixedDeciduous);
+//print('sample polygons step 2', sampleData_dec_vs_con);
+//print('sample polygons step 3', sampleData_ash_vs_beech);
+//print('sample data used in classification', combined_sample_polygons);
+
+// Equalised sample data as polygon-FeatureCollection.
+//print('sample polygons deciduous shortened', polygonDeciduous_shortened);
+//print('sample polygons beech shortened', polygon_beech_healthy_shortened);
+//print('sample polygons mixed deciduous shortened', polygonMixedDeciduous_shortened);
+
+// Equalised sample data as point-FeatureCollection.
+//print('sample points deciduous', samplepoints1_1);
+//print('sample points deciduous shortend', samplepoints1_1_shortened);
+//print('sample points coniferous', samplepoints1_2);
+//print('sample points ash', samplepoints2_1);
+//print('sample points beech', samplepoints2_2);
+//print('sample points beech shortend', samplepoints2_2_shortened);
+//print('sample points mixed deciduous', samplepoints2_3);
+//print('sample points mixed deciduous shortend', samplepoints2_3_shortened);
+//print('sample data step 2 shortened', sampleData_dec_vs_con_shortened);
+//print('sample data step 3 shortened', sampleData_ash_vs_beech_shortened);
+//print('equalised sample data used in classification', combined_sample_polygons_shortened);
+
+// Sample data fpr montoring step.
+//print('sample data used in monitoring step', sample_data_for_monitoring);
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////                                       Visualization Section.                                         ////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Define diferent palettes for layer styling.
+var vizParamsCloudMaskMasked = {
+  palette: ['#000080', '#008000'], 
+  min: 0, 
+  max: 1
+};
+  
+var vizParamsRGB = {
+  bands: ['B4', 'B3', 'B2'],
+  min: 0,
+  max: 3000
+};
+
+var vizParamsDecCon = {
+  palette: [
+    '3ded00', // class 0 deciduous
+    '217f00'  // class 1 coniferous
+  ],
+  min: 0,
+  max: 1
+};
+
+var vizParamsBeAsh = {
+  palette: [
+    'ffbd00', // class 0 ash
+    'ff7575', // class 1 beech
+    '364cca', // class 2 mixedDeciduous
+  ],
+  min: 0,
+  max: 2
+};
+
+var vizParamsDiff = {
+  palette: [
+    '750000', // -10   1
+    'ff0000', // - 9   2
+    'ffc900', // - 1   3
+    '17c000', //   0   4
+    '1efff1', //   1   5
+    '0046ff', //   9   6
+    '020073'  //  10   7
+  ],
+  min: 1,
+  max: 7
+};
+
+var empty = ee.Image().byte();
+var outlineStudyArea = empty.paint({
+  featureCollection: studyArea,
+  color: 1,
+  width: 2
+});
+var ch = empty.paint({
+  featureCollection: convexHull,
+  color: 1,
+  width:2
+});
+
+Map.addLayer(ee.Image('COPERNICUS/S2/20160505T103032_20160505T103027_T32UNU'), vizParamsRGB, 'reference RGB 2016', false);
+Map.addLayer(ee.Image('COPERNICUS/S2_SR/20170517T102031_20170517T102352_T32UNU'), vizParamsRGB, 'reference RGB 2017', false);
+Map.addLayer(ee.Image('COPERNICUS/S2_SR/20180427T102019_20180427T102022_T32UNU'), vizParamsRGB, 'reference RGB 2018', false);
+Map.addLayer(ee.Image('COPERNICUS/S2_SR/20180701T102021_20180701T102404_T32UNU'), vizParamsRGB, 'reference RGB 2019', false);
+
+Map.addLayer(imageFromSe2col201xList, vizParamsRGB, 'image from list image collection', false);
+Map.addLayer(outlineStudyArea, {palette: 'FF0000'}, 'study area', false); 
+//Map.addLayer(ch, {palette: 'FF0000'}, 'convex hull');
+//Map.addLayer(imageFromSe2col201xcloudMask, vizParamsCloudMaskMasked, 'image from list cloud mask');
+
+//Map.addLayer(ee.Image('users/albremoteforest/main_forest_2018').select('classification_step_2_classification'), vizParamsDecCon, 'original main forest step 2');
+//Map.addLayer(ee.Image('users/albremoteforest/main_forest_2018').select('classification_step_3_classification'), vizParamsBeAsh, 'original main forest step 3');
+//Map.addLayer(ee.Image(mainForest.select('classification_step_2_classification')), vizParamsDecCon, 'deciduous vs. coniferous', false);
+//Map.addLayer(ee.Image(mainForest.select('classification_step_3_classification')), vizParamsBeAsh, 'ash vs. beech vs. mixedDeciduous', false);
+
+//Map.addLayer(polygonDeciduous, {color: '3ded00'}, 'polygon deciduous');
+//Map.addLayer(polygonConiferous, {color: '217f00'}, 'polygon coniferous');
+//Map.addLayer(polygon_ash_healthy, {color: 'ffbd00'}, 'polygon ash');
+//Map.addLayer(polygon_beech_healthy, {color: 'ff7575'}, 'polygon beech');
+//Map.addLayer(polygonMixedDeciduous, {color: '364cca'}, 'polygon mixed deciduous');
+
+// Selective monitoring result visualization.
+if (doMonitoring === true) {
+  Map.addLayer(monitoring_step_image, vizParamsRGB, 'rgb of deviation image');
+  Map.addLayer(monitoring_step_deviation, {min: 0, max: 100, palette: ['2aff00', 'C20000']}, 'deviation image');
+}
