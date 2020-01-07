@@ -1,0 +1,492 @@
+// Function that categorizes the classification result based on the classification probability (calculated by the RF-classifier).
+// Old approach, is not used in the masters thesis.
+var classificationVSprobability = function(img, classification_step) {
+  var img_clas = img.select('classification_step_'+classification_step+'_classification'); 
+  var img_prob = img.select('classification_step_'+classification_step+'_probability');
+  
+  var clasProb_90_100_class0 = img_clas.eq(0).multiply(img_prob.lte(0.10));
+  //clasProb_90_100_class0 = clasProb_90_100_class0.updateMask(clasProb_90_100_class0);
+  clasProb_90_100_class0 = clasProb_90_100_class0.multiply(10);
+  
+  var clasProb_90_100_class1 = img_clas.eq(1).multiply(img_prob.gte(0.90));
+  //clasProb_90_100_class1 = clasProb_90_100_class1.updateMask(clasProb_90_100_class1);
+  clasProb_90_100_class1 = clasProb_90_100_class1.multiply(20);
+  
+  var combined = clasProb_90_100_class0.add(clasProb_90_100_class1);
+  combined = combined.updateMask(combined);
+  
+  return combined.rename('classification_step_'+classification_step);
+  //return empty_image.addBands(clasProb_90_100_class0).addBands(clasProb_90_100_class1);
+};
+
+
+// Function that compares two main forest classifications. Basically computes and returns the difference between first_year
+// image and second_year image.
+var compareMainForest = function(first_year, second_year, classification_step) {
+  //first_year = ee.String(first_year);
+  //second_year = ee.String(second_year);
+  //classification_step = ee.String(classification_step);
+  // Select correct main forest classification for first year.
+  var first_year_image = ee.Image(ee.Algorithms.If(
+    ee.Algorithms.IsEqual(first_year, '2016'),
+    first_year_image = ee.Image('users/albremoteforest/main_forest_2016_prob'),
+    ee.Algorithms.If(
+      ee.Algorithms.IsEqual(first_year, '2017'),
+      first_year_image = ee.Image('users/albremoteforest/main_forest_2017_prob'),
+      ee.Algorithms.If(
+        ee.Algorithms.IsEqual(first_year, '2018'),
+        first_year_image = ee.Image('users/albremoteforest/main_forest_2018_prob'),
+        ee.Algorithms.If(
+          ee.Algorithms.IsEqual(first_year, '2019'),
+          first_year_image = ee.Image('users/albremoteforest/main_forest_2019_prob'),
+          first_year_image = ee.Image([])
+        )  
+      )
+    )
+  ));
+  // Select correct main forest classification for second year.
+  var second_year_image = ee.Image(ee.Algorithms.If(
+    ee.Algorithms.IsEqual(second_year, '2016'),
+    second_year_image = ee.Image('users/albremoteforest/main_forest_2016_prob'),
+    ee.Algorithms.If(
+      ee.Algorithms.IsEqual(second_year, '2017'),
+      second_year_image = ee.Image('users/albremoteforest/main_forest_2017_prob'),
+      ee.Algorithms.If(
+        ee.Algorithms.IsEqual(second_year, '2018'),
+        second_year_image = ee.Image('users/albremoteforest/main_forest_2018_prob'),
+        ee.Algorithms.If(
+          ee.Algorithms.IsEqual(second_year, '2019'),
+          second_year_image = ee.Image('users/albremoteforest/main_forest_2019_prob'),
+          second_year_image = ee.Image([])
+        )  
+      )
+    )
+  ));
+  // Select classification step.
+  var classification_step_number = ee.String(ee.Algorithms.If(
+    ee.Algorithms.IsEqual(classification_step, '2'),
+    classification_step_number = ee.String('classification_step_2'),
+    ee.Algorithms.If(
+      ee.Algorithms.IsEqual(classification_step, '3'),
+      classification_step_number = ee.String('classification_step_3'),
+      classification_step_number = ee.String('')
+    )
+  ));  
+  
+  // Combine classificatin result with classification probability.
+  first_year_image = classificationVSprobability(first_year_image, classification_step);
+  second_year_image = classificationVSprobability(second_year_image, classification_step);
+  
+  // Fully define and pre-process images used in subtraction.
+  first_year_image = first_year_image.select(classification_step_number)
+  .remap([10,20], [1,10])
+  .unmask()
+  .rename('classification_step_'+classification_step);
+  
+  second_year_image = second_year_image.select(classification_step_number)
+  .remap([10,20], [1,10])
+  .unmask()
+  .rename('classification_step_'+classification_step);
+  
+  // Mask pixels that are masked in both images.
+  var mask_maskedPxlFirst = first_year_image.eq(0);
+  var mask_maskedPxlSecond = second_year_image.eq(0);
+  var mask_maskedPxlFirstAndSecond = ee.Image(mask_maskedPxlFirst.and(mask_maskedPxlSecond)).remap([0,1], [1,0]);
+  
+  // Calculate difference (first - second).
+  var difference = first_year_image.subtract(second_year_image);
+  
+  // Remap to display difference image with color map correctly.
+  var difference_remapped = difference
+  .remap([-10, -9, -1, 0, 1, 9, 10], [1, 2, 3, 4, 5, 6, 7])
+  .rename('difference_image_'+first_year+'_'+second_year);
+  
+  // Mask out pixels that were masked in first AND second image.
+  var difference_remapped_masked = difference_remapped.updateMask(mask_maskedPxlFirstAndSecond);
+  
+  // Combine first_year, second_year and difference picture in Dictionary for returning.
+  var dic = ee.Dictionary({
+    'first_year': first_year_image,
+    'second_year': second_year_image,
+    'difference_picture': difference_remapped_masked
+  });
+  
+  // Return image.
+  //return difference_remapped_masked;
+  return dic;
+  //return classification_step_number;
+  //return first_year_image;
+};
+
+
+// Function that compares all pixel values of a class of one time step with the mean value of all the sampled values
+// of that class for that time step, per band. Returns an image with the magnitude of deviation color-coded.
+var mean_value_comparison = function(func_image_collection, func_sample_polygons, func_band_model, func_class) {
+  var func_studyArea = ee.FeatureCollection('users/albremoteforest/grenzen_rough_WGS1984');
+  func_image_collection = ee.ImageCollection(func_image_collection);
+  func_sample_polygons = ee.FeatureCollection(func_sample_polygons);
+  func_band_model = ee.List(func_band_model);
+  func_class = ee.String(func_class);
+  var func_sample_polygons_one_class = func_sample_polygons.filterMetadata('species_name', 'equals', func_class);
+  var func_year = ee.Date(
+    ee.Image(func_image_collection.toList(func_image_collection.size()).get(0))
+    .get('system:time_start'))
+    .format('YYYY');
+  // Prepare main forest classification for masking.
+  var func_main_forest = ee.Image(ee.Algorithms.If(
+    ee.Algorithms.IsEqual(func_year, '2016'),
+    func_main_forest = ee.Image('users/albremoteforest/main_forest_2016'),
+    ee.Algorithms.If(
+      ee.Algorithms.IsEqual(func_year, '2017'),
+      func_main_forest = ee.Image('users/albremoteforest/main_forest_2017'),
+      ee.Algorithms.If(
+        ee.Algorithms.IsEqual(func_year, '2018'),
+        func_main_forest = ee.Image('users/albremoteforest/main_forest_2018'),
+        ee.Algorithms.If(
+          ee.Algorithms.IsEqual(func_year, '2019'),
+          func_main_forest = ee.Image('users/albremoteforest/main_forest_2019'),
+          func_main_forest = ee.Image([])
+        )
+      )
+    )
+  ));
+
+  var func_main_forest1 = ee.Algorithms.If(
+    ee.Algorithms.IsEqual(func_class, 'deciduous'),
+    func_main_forest1 = func_main_forest.select('classification_step_2_classification').remap([0, 1], [1, 0]),
+    ee.Algorithms.If(
+      ee.Algorithms.IsEqual(func_class, 'coniferous'),
+      func_main_forest1 = func_main_forest.select('classification_step_2_classification'),
+      func_main_forest1 = ([])
+    )  
+  );
+ 
+  
+  // Prepare cloud masks.
+  var func_cloud_masks = ee.Image(ee.Algorithms.If(
+    ee.Algorithms.IsEqual(func_year, '2016'),
+    func_cloud_masks = ee.Image('users/albremoteforest/cloud_masks_2016-01-01---2016-12-31'),
+    ee.Algorithms.If(
+      ee.Algorithms.IsEqual(func_year, '2017'),
+      func_cloud_masks = ee.Image('users/albremoteforest/cloud_masks_2017-01-01---2017-12-31'),
+      ee.Algorithms.If(
+        ee.Algorithms.IsEqual(func_year, '2018'),
+        func_cloud_masks = ee.Image('users/albremoteforest/cloud_masks_2018-01-01---2018-12-31'),
+        ee.Algorithms.If(
+          ee.Algorithms.IsEqual(func_year, '2019'),
+          func_cloud_masks = ee.Image('users/albremoteforest/cloud_masks_2019-01-01---2019-10-25'),
+          func_cloud_masks = ee.Image([])
+        )
+      )
+    )
+  ));
+  
+  
+  // Step 1: Sampling points, calculate mean.
+  // Sampling points iteratively and calculate mean of sampled points.
+  // Saved in dictionary {image_id: [mean_b3, mean_b4, ...]}.
+  var sampled_points_dic = func_image_collection.iterate(
+    function(func_image, dictionary) {
+      dictionary = ee.Dictionary(dictionary);
+      var image_id_list = ee.List([func_image.id()]);
+      var image_id = func_image.id();
+            
+      // Select the cloud mask for func_image and mask that image.
+      var func_image_date = ee.Date(func_image.get('system:time_start')).format('YYYY-MM-dd').replace('-','','g');
+      var func_cloud_masks_band_names = func_cloud_masks.bandNames();
+      var func_cloud_masks_band_names_list = func_cloud_masks_band_names.map(function(instance) {
+        return ee.String(instance).rindex(func_image_date);
+      });
+      var right_cm = func_cloud_masks_band_names_list.indexOf(19);
+      var matched_cm_string = ee.String(func_cloud_masks_band_names.get(right_cm));
+      var func_cloud_mask = ee.Image(func_cloud_masks.select(matched_cm_string)).unmask().remap([0, 1], [1, 0]);
+      var func_image_masked = func_image.updateMask(func_cloud_mask);
+      
+      var sampled_points = func_image_masked.sample({
+        region: func_sample_polygons_one_class,
+        scale: 10,
+        dropNulls: false
+      });
+      
+      var aggregated_mean_sampled_points = func_band_model.map(function(func_band_name) {
+        func_band_name = ee.String(func_band_name);
+        var aggregated_mean = ee.Number(sampled_points.aggregate_mean(func_band_name));
+        return aggregated_mean;
+      });
+      
+      var dic_temp = ee.Dictionary.fromLists(image_id_list, image_id_list);
+      dic_temp = dic_temp.set(image_id, aggregated_mean_sampled_points);
+      return dictionary.combine(dic_temp);
+    },
+    ee.Dictionary({'used_bands': func_band_model})
+  );
+    
+  // Step 2: Prepare every image in func_image_collection --> select bands, clip, mask class, mask clouds.
+  var prepared_images = func_image_collection.iterate(
+    function(func_image_1, list) {
+      // Select bands and clip to study area.
+      func_image_1 = ee.Image(func_image_1);
+      list = ee.List(list);
+      func_image_1 = func_image_1
+      .select(func_band_model)
+      .clip(func_studyArea);
+      // Mask out pixels that are not described in func_class.
+      func_image_1 = func_image_1.updateMask(func_main_forest1);
+      // Mask out clouds.
+      // Select the cloud mask for func_image_1 and mask that image.
+      var func_image1_date = ee.Date(func_image_1.get('system:time_start')).format('YYYY-MM-dd').replace('-','','g');
+      var func_cloud_masks_band_names1 = func_cloud_masks.bandNames();
+      var func_cloud_masks_band_names_list1 = func_cloud_masks_band_names1.map(function(instance) {
+        return ee.String(instance).rindex(func_image1_date);
+      });
+      var right_cm1 = func_cloud_masks_band_names_list1.indexOf(19);
+      var matched_cm_string1 = ee.String(func_cloud_masks_band_names1.get(right_cm1));
+      var func_cloud_mask1 = ee.Image(func_cloud_masks.select(matched_cm_string1)).unmask().remap([0, 1], [1, 0]);
+      func_image_1 = func_image_1.updateMask(func_cloud_mask1);
+      // Return.
+      return list.add(func_image_1);
+    },
+    ee.List([])
+  );
+  
+  // Step 3: Calculate deviation refl values in image from sampled mean values of class.
+  // Hier muss ich zuerst anhand der image_id die richtigen mean values aus dem Dictionary aus Step 1 ziehen.
+  // dann einfach mit der bereits getesteten Formel aus "Vorbereitung des Monitorings" die Abweichung berechnen.
+  var deviation_images = func_image_collection.iterate(
+    function(func_image_2, func_mean_image_list) {
+      func_image_2 = ee.Image(func_image_2);
+      var func_image_id = func_image_2.id();
+      var func_mean_image_values = ee.Dictionary(sampled_points_dic).get(func_image_id);
+      
+      var wrap = ee.List.sequence(0, func_band_model.size().subtract(1)).iterate(
+        function(instance1, func_mean_image_1) {
+          // Construct constant value (mean value) image.
+          var func_mean_image_temp = ee.Image(ee.Number(ee.List(func_mean_image_values).get(instance1)));
+          // Construct refl image (the same procedure than for prepared_images).
+          var func_refl_image_temp = func_image_2.select(func_band_model).clip(func_studyArea);
+          func_refl_image_temp = func_refl_image_temp.updateMask(func_main_forest1);
+          
+          // Select the cloud mask for func_refl_image_temp and mask that image.
+          var func_image2_date = ee.Date(func_image_2.get('system:time_start')).format('YYYY-MM-dd').replace('-','','g');
+          var func_cloud_masks_band_names2 = func_cloud_masks.bandNames();
+          var func_cloud_masks_band_names_list2 = func_cloud_masks_band_names2.map(function(instance) {
+            return ee.String(instance).rindex(func_image2_date);
+          });
+          var right_cm2 = func_cloud_masks_band_names_list2.indexOf(19);
+          var matched_cm_string2 = ee.String(func_cloud_masks_band_names2.get(right_cm2));
+          var func_cloud_mask2 = ee.Image(func_cloud_masks.select(matched_cm_string2)).unmask().remap([0, 1], [1, 0]);
+          func_refl_image_temp = func_refl_image_temp.updateMask(func_cloud_mask2);
+          
+          // Select one band iteratively.
+          func_refl_image_temp = func_refl_image_temp.select(ee.String(ee.List(func_band_model).get(instance1)));
+          
+          // Calculate deviation between mean and actual reflectance value. Iteratively for each band in func_band_model.
+          var func_deviation_image = func_mean_image_temp.subtract(func_refl_image_temp).abs().divide(func_mean_image_temp).multiply(100);
+          func_deviation_image = func_deviation_image.rename([func_band_model.get(instance1)]);
+          
+          return ee.Image(func_mean_image_1).addBands(func_deviation_image);
+          //return ee.List(func_mean_image_1).add(right_cm);
+        },
+        ee.Image([])
+      );
+     
+      return ee.List(func_mean_image_list).add(wrap);
+      //return ee.List(func_mean_image_list).add(func_mean_image_values);
+    },
+    ee.List([])
+  );
+
+  //return sampled_points_dic;
+  //return prepared_images;
+  return deviation_images;
+};
+
+
+// Function that compares all pixel values of a class of one time step with the mean value of all the sampled values
+// of that class for that time step, per band. Returns an image with the magnitude of deviation color-coded.
+var mean_value_comparison_different_timesteps = function(func_image_collection, func_sample_polygons, func_band_model, func_class, func_year_compare) {
+  var func_studyArea = ee.FeatureCollection('users/albremoteforest/grenzen_rough_WGS1984');
+  func_image_collection = ee.ImageCollection(func_image_collection);
+  func_sample_polygons = ee.FeatureCollection(func_sample_polygons);
+  func_band_model = ee.List(func_band_model);
+  func_class = ee.String(func_class);
+  func_year_compare = ee.String(func_year_compare);
+  var func_sample_polygons_one_class = func_sample_polygons.filterMetadata('species_name', 'equals', func_class);
+  var func_year = ee.Date(
+    ee.Image(func_image_collection.toList(func_image_collection.size()).get(0))
+    .get('system:time_start'))
+    .format('YYYY');
+  // Prepare main forest classification for masking.
+  var func_main_forest = ee.Image(ee.Algorithms.If(
+    ee.Algorithms.IsEqual(func_year_compare, '2016'),
+    func_main_forest = ee.Image('users/albremoteforest/main_forest_2016_old'),
+    ee.Algorithms.If(
+      ee.Algorithms.IsEqual(func_year_compare, '2017'),
+      func_main_forest = ee.Image('users/albremoteforest/main_forest_2017_old'),
+      ee.Algorithms.If(
+        ee.Algorithms.IsEqual(func_year_compare, '2018'),
+        func_main_forest = ee.Image('users/albremoteforest/main_forest_2018_old'),
+        ee.Algorithms.If(
+          ee.Algorithms.IsEqual(func_year_compare, '2019'),
+          func_main_forest = ee.Image('users/albremoteforest/main_forest_2019_old'),
+          func_main_forest = ee.Image([])
+        )
+      )
+    )
+  ));
+
+  var func_main_forest1 = ee.Algorithms.If(
+    ee.Algorithms.IsEqual(func_class, 'deciduous'),
+    func_main_forest1 = func_main_forest.select('classification_step_2_classification').remap([0, 1], [1, 0]),
+    ee.Algorithms.If(
+      ee.Algorithms.IsEqual(func_class, 'coniferous'),
+      func_main_forest1 = func_main_forest.select('classification_step_2_classification'),
+      func_main_forest1 = ([])
+    )  
+  );
+ 
+  
+  // Prepare cloud masks.
+  var func_cloud_masks = ee.Image(ee.Algorithms.If(
+    ee.Algorithms.IsEqual(func_year, '2016'),
+    func_cloud_masks = ee.Image('users/albremoteforest/cloud_masks_2016-01-01---2016-12-31'),
+    ee.Algorithms.If(
+      ee.Algorithms.IsEqual(func_year, '2017'),
+      func_cloud_masks = ee.Image('users/albremoteforest/cloud_masks_2017-01-01---2017-12-31'),
+      ee.Algorithms.If(
+        ee.Algorithms.IsEqual(func_year, '2018'),
+        func_cloud_masks = ee.Image('users/albremoteforest/cloud_masks_2018-01-01---2018-12-31'),
+        ee.Algorithms.If(
+          ee.Algorithms.IsEqual(func_year, '2019'),
+          func_cloud_masks = ee.Image('users/albremoteforest/cloud_masks_2019-01-01---2019-10-25'),
+          func_cloud_masks = ee.Image([])
+        )
+      )
+    )
+  ));
+  
+  
+  // Step 1: Sampling points, calculate mean.
+  // Sampling points iteratively and calculate mean of sampled points.
+  // Saved in dictionary {image_id: [mean_b3, mean_b4, ...]}.
+  var sampled_points_dic = func_image_collection.iterate(
+    function(func_image, dictionary) {
+      dictionary = ee.Dictionary(dictionary);
+      var image_id_list = ee.List([func_image.id()]);
+      var image_id = func_image.id();
+            
+      // Select the cloud mask for func_image and mask that image.
+      var func_image_date = ee.Date(func_image.get('system:time_start')).format('YYYY-MM-dd').replace('-','','g');
+      var func_cloud_masks_band_names = func_cloud_masks.bandNames();
+      var func_cloud_masks_band_names_list = func_cloud_masks_band_names.map(function(instance) {
+        return ee.String(instance).rindex(func_image_date);
+      });
+      var right_cm = func_cloud_masks_band_names_list.indexOf(19);
+      var matched_cm_string = ee.String(func_cloud_masks_band_names.get(right_cm));
+      var func_cloud_mask = ee.Image(func_cloud_masks.select(matched_cm_string)).unmask().remap([0, 1], [1, 0]);
+      var func_image_masked = func_image.updateMask(func_cloud_mask);
+      
+      var sampled_points = func_image_masked.sample({
+        region: func_sample_polygons_one_class,
+        scale: 10,
+        dropNulls: false
+      });
+      
+      var aggregated_mean_sampled_points = func_band_model.map(function(func_band_name) {
+        func_band_name = ee.String(func_band_name);
+        var aggregated_mean = ee.Number(sampled_points.aggregate_mean(func_band_name));
+        return aggregated_mean;
+      });
+      
+      var dic_temp = ee.Dictionary.fromLists(image_id_list, image_id_list);
+      dic_temp = dic_temp.set(image_id, aggregated_mean_sampled_points);
+      return dictionary.combine(dic_temp);
+    },
+    ee.Dictionary({'used_bands': func_band_model})
+  );
+    
+  // Step 2: Prepare every image in func_image_collection --> select bands, clip, mask class, mask clouds.
+  var prepared_images = func_image_collection.iterate(
+    function(func_image_1, list) {
+      // Select bands and clip to study area.
+      func_image_1 = ee.Image(func_image_1);
+      list = ee.List(list);
+      func_image_1 = func_image_1
+      .select(func_band_model)
+      .clip(func_studyArea);
+      // Mask out pixels that are not described in func_class.
+      func_image_1 = func_image_1.updateMask(func_main_forest1);
+      // Mask out clouds.
+      // Select the cloud mask for func_image_1 and mask that image.
+      var func_image1_date = ee.Date(func_image_1.get('system:time_start')).format('YYYY-MM-dd').replace('-','','g');
+      var func_cloud_masks_band_names1 = func_cloud_masks.bandNames();
+      var func_cloud_masks_band_names_list1 = func_cloud_masks_band_names1.map(function(instance) {
+        return ee.String(instance).rindex(func_image1_date);
+      });
+      var right_cm1 = func_cloud_masks_band_names_list1.indexOf(19);
+      var matched_cm_string1 = ee.String(func_cloud_masks_band_names1.get(right_cm1));
+      var func_cloud_mask1 = ee.Image(func_cloud_masks.select(matched_cm_string1)).unmask().remap([0, 1], [1, 0]);
+      func_image_1 = func_image_1.updateMask(func_cloud_mask1);
+      // Return.
+      return list.add(func_image_1);
+    },
+    ee.List([])
+  );
+  
+  // Step 3: Calculate deviation refl values in image from sampled mean values of class.
+  // Hier muss ich zuerst anhand der image_id die richtigen mean values aus dem Dictionary aus Step 1 ziehen.
+  // dann einfach mit der bereits getesteten Formel aus "Vorbereitung des Monitorings" die Abweichung berechnen.
+  var deviation_images = func_image_collection.iterate(
+    function(func_image_2, func_mean_image_list) {
+      func_image_2 = ee.Image(func_image_2);
+      var func_image_id = func_image_2.id();
+      var func_mean_image_values = ee.Dictionary(sampled_points_dic).get(func_image_id);
+      
+      var wrap = ee.List.sequence(0, func_band_model.size().subtract(1)).iterate(
+        function(instance1, func_mean_image_1) {
+          // Construct constant value (mean value) image.
+          var func_mean_image_temp = ee.Image(ee.Number(ee.List(func_mean_image_values).get(instance1)));
+          // Construct refl image (the same procedure than for prepared_images).
+          var func_refl_image_temp = func_image_2.select(func_band_model).clip(func_studyArea);
+          func_refl_image_temp = func_refl_image_temp.updateMask(func_main_forest1);
+          
+          // Select the cloud mask for func_refl_image_temp and mask that image.
+          var func_image2_date = ee.Date(func_image_2.get('system:time_start')).format('YYYY-MM-dd').replace('-','','g');
+          var func_cloud_masks_band_names2 = func_cloud_masks.bandNames();
+          var func_cloud_masks_band_names_list2 = func_cloud_masks_band_names2.map(function(instance) {
+            return ee.String(instance).rindex(func_image2_date);
+          });
+          var right_cm2 = func_cloud_masks_band_names_list2.indexOf(19);
+          var matched_cm_string2 = ee.String(func_cloud_masks_band_names2.get(right_cm2));
+          var func_cloud_mask2 = ee.Image(func_cloud_masks.select(matched_cm_string2)).unmask().remap([0, 1], [1, 0]);
+          func_refl_image_temp = func_refl_image_temp.updateMask(func_cloud_mask2);
+          
+          // Select one band iteratively.
+          func_refl_image_temp = func_refl_image_temp.select(ee.String(ee.List(func_band_model).get(instance1)));
+          
+          // Calculate deviation between mean and actual reflectance value. Iteratively for each band in func_band_model.
+          var func_deviation_image = func_mean_image_temp.subtract(func_refl_image_temp).abs().divide(func_mean_image_temp).multiply(100);
+          func_deviation_image = func_deviation_image.rename([func_band_model.get(instance1)]);
+          
+          return ee.Image(func_mean_image_1).addBands(func_deviation_image);
+          //return ee.List(func_mean_image_1).add(right_cm);
+        },
+        ee.Image([])
+      );
+     
+      return ee.List(func_mean_image_list).add(wrap);
+      //return ee.List(func_mean_image_list).add(func_mean_image_values);
+    },
+    ee.List([])
+  );
+
+  //return sampled_points_dic;
+  //return prepared_images;
+  return deviation_images;
+};
+
+
+exports.compareMainForest = compareMainForest;
+exports.classificationVSprobability = classificationVSprobability;
+exports.mean_value_comparison = mean_value_comparison;
+exports.mean_value_comparison_different_timesteps = mean_value_comparison_different_timesteps;
