@@ -1,0 +1,116 @@
+// Function that calculates the area in square meters.
+var measure_area = function(func_img, func_studyArea) {
+  var func_area = func_img.multiply(ee.Image.pixelArea());
+  // Sum the values (sqm of the individual pixels) of all pixels to get the overall area.
+  var func_stats = func_area.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: func_studyArea,
+    scale: 10,
+    maxPixels: 1e9
+  });
+
+  //return func_area;
+  return func_stats;
+};
+
+
+// Function to simply clip an Image.
+var clipSingleImage = function(image, clipping_geometry) {
+  return image.clip(clipping_geometry);
+};
+
+
+// Function to simply clip every Image of an Image Collection.
+var clipImage = function(clipping_geometry) {
+  var wrap = function(image) {
+    var clipped_image = image.clip(clipping_geometry);
+    return clipped_image;
+  };
+  return wrap;
+};
+
+
+// Function that deletes bands that are not needed in further analysis.
+var deleting_unnecessary_stuff = function(func_image) {
+  func_image = ee.Image(func_image);
+  var func_bands_model = ee.List(['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11', 'B12', 'QA60']);
+  return func_image.select(func_bands_model);
+};
+
+
+// Function that adds NDVI values for the whole scene as band layer to every image of an image Collection.
+var adding_ndvi = function(func_image) {
+  func_image = ee.Image(func_image);
+  var red_band = func_image.select('B4');
+  var NIR_band = func_image.select('B8');
+  
+  var func_ndvi = NIR_band.subtract(red_band).divide(NIR_band.add(red_band)).rename('NDVI');
+  
+  return func_image.addBands(func_ndvi);
+};
+
+
+// Function that adds EVI values for the whole scene as band layer to every image of an image Collection.
+var adding_evi = function(func_image) {
+  func_image = ee.Image(func_image);
+  var func_evi = func_image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR': func_image.select('B8').divide(10000),
+      'RED': func_image.select('B4').divide(10000),
+      'BLUE': func_image.select('B2').divide(10000)
+    }
+  ).rename('EVI');
+    
+  return func_image.addBands(func_evi);
+};
+
+
+// Function that adds both NDVI and EVI for the whole scene as band layer to every image of an image collection.
+var adding_ndvi_evi = function(func_image) {
+  func_image = ee.Image(func_image);
+  // Adding NDVI.
+  var red_band = func_image.select('B4');
+  var NIR_band = func_image.select('B8');
+  var func_ndvi = NIR_band.subtract(red_band).divide(NIR_band.add(red_band)).rename('NDVI');
+  // Adding EVI.
+  var func_evi = func_image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR': func_image.select('B8').divide(10000),
+      'RED': func_image.select('B4').divide(10000),
+      'BLUE': func_image.select('B2').divide(10000)
+    }
+  ).rename('EVI');
+    
+  return func_image.addBands(func_ndvi).addBands(func_evi);
+};
+
+
+// Function that shortens features of a Feature Collection to a specific number.
+// Used to equal out training samples for RF classifier.
+var shorten_FC = function(func_FC, func_size) {
+  func_FC = ee.FeatureCollection(func_FC);
+  var func_FC_list = func_FC.toList(func_FC.size());
+  func_size = ee.Number(func_size);
+  
+  var func_FC_numbered = ee.List.sequence(0, func_FC.size().subtract(1)).map(
+    function(func_number) {
+    var wrap = ee.Feature(func_FC_list.get(func_number));
+      //wrap = wrap.set('chose', func_number);
+      
+      return wrap.set('chose', func_number);
+    }
+  );
+  
+  func_FC_numbered = ee.FeatureCollection(func_FC_numbered);
+  var func_FC_selected = func_FC_numbered.filterMetadata('chose', 'less_than', func_size);
+  return func_FC_selected;
+};
+
+exports.measure_area = measure_area;
+exports.clipSingleImage = clipSingleImage;
+exports.clipImage = clipImage;
+exports.deleting_unnecessary_stuff = deleting_unnecessary_stuff;
+exports.adding_ndvi = adding_ndvi;
+exports.adding_evi = adding_evi;
+exports.adding_ndvi_evi = adding_ndvi_evi;
+exports.shorten_FC = shorten_FC;
