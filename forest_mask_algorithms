@@ -1,0 +1,108 @@
+var cloud_mask_algorithms = require('users/albremoteforest/DontDelete:cloud_mask_algorithms');
+var altering_IC_algorithms = require('users/albremoteforest/DontDelete:altering_IC_algorithms');
+
+var studyArea = ee.FeatureCollection('users/albremoteforest/grenzen_rough_WGS1984');
+var sampleData = ee.FeatureCollection('users/albremoteforest/forest_nonForest');
+var convexHull = ee.FeatureCollection('users/albremoteforest/SP201602_E_2016_CH_WGS1984');
+
+
+// Funciton that takes a list with year names and computes a median picture from all the cloud-free images in these years.
+var forestMask_medianPicture = function(func_list_year, func_list) {
+  func_list = ee.List(func_list);
+  // Load basic image collection and filter for zero cloud cover.
+  var start_date = ee.String(func_list_year).cat(ee.String('-01-01'));
+  var end_date = ee.String(func_list_year).cat(ee.String('-12-31'));
+  var se2col_all = ee.ImageCollection('COPERNICUS/S2')
+  .filterDate(start_date, end_date)
+  .filterBounds(convexHull)
+  .filter(ee.Filter.eq('CLOUDY_PIXEL_PERCENTAGE', 0))
+  .sort('system:time_start');
+  var se2col_unique1 = se2col_all.iterate(
+    cloud_mask_algorithms.getRidOfDoubles, 
+    ee.List([ee.Image(0).set('system:time_start', 0, 'repetition?', 1)]));
+  var se2col_unique2 = ee.List(se2col_unique1).filter(ee.Filter.neq('repetition?', 1));
+  var se2col = ee.ImageCollection(se2col_unique2);
+  // Added Vegetation Indices.
+  var se2col_veggie = se2col.map(altering_IC_algorithms.adding_ndvi_evi);
+  // Combine pictures to median image.
+  var medianPicture = ee.Image(se2col_veggie.median()).clip(studyArea).set({'year': func_list_year});
+  
+  return func_list.add(medianPicture);
+};
+
+
+// Function that classifies every image of an image collection.
+var forestMask_classification = function(func_image) {
+  func_image = ee.Image(func_image);
+  //var func_image_year = ee.Date(func_image.get().format('YYYY');
+  var func_bands = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B10', 'B11', 'B12', 'NDVI', 'EVI'];
+  // Sampling training data.
+  var training = func_image.select(func_bands).sampleRegions({
+    collection: sampleData, 
+    properties: ['landuse'], 
+    scale: 30
+  });
+  // Train classifier.
+  var classifier = ee.Classifier.randomForest(250).train({
+    features: training,
+    classProperty: 'landuse',
+    inputProperties: func_bands
+  });
+  // Classify image.
+  var classified_image = func_image.select(func_bands).classify(classifier);
+  
+  return classified_image.copyProperties(func_image);
+};
+
+
+// Function that computes the difference between two binary layers.
+var forestMask_difference = function(func_IC) {
+  // Used variables.
+  func_IC = ee.ImageCollection(func_IC);
+  var func_IC_list = func_IC.toList(func_IC.size());
+  // Iterate over IC and compute difference between every picture and the following.
+  var buildDifference = func_IC.iterate(
+    function(func_img, func_list) {
+      func_list = ee.List(func_list);
+      // Get year and year after for properties.
+      var year = ee.Number.parse(func_img.get('year'));
+      var year_plus = year.add(1);
+      
+      var iteration = ee.Number(ee.Number(func_list.get(-1)));
+      
+      var pic_later = ee.Image(func_IC_list.get(iteration));
+      var pic_now = ee.Image(func_img);
+      var difference_img = pic_later.neq(pic_now).set({
+        'difference_between': ee.String(year).cat('_and_').cat(year_plus)});
+      
+      iteration = ee.Algorithms.If(
+        iteration.lt(func_IC.size().subtract(1)),
+        ee.Number(ee.Number(func_list.get(-1)).add(1)),
+        ee.Number(ee.Number(func_list.get(-1)))
+      );
+      
+      func_list = ee.List(func_list).add(difference_img);
+      return ee.List(func_list).add(iteration);
+    },
+    ee.List([ee.Number(1)])
+  );
+  var remove_from_list = ee.List.sequence(1, func_IC.size()).replace(func_IC.size(), func_IC.size().subtract(1));
+  return ee.List(buildDifference).removeAll(remove_from_list).slice(0, func_IC.size().subtract(1));
+};
+
+
+// Function that combines all individual forest masks into a single ee.Image with the different 
+// masks beeing the individual layers of that new image.
+var forestMasks2Image = function(forest_mask, func_image) {
+  forest_mask = ee.Image(forest_mask);
+  func_image = ee.Image(func_image);
+  var imageID = ee.String(forest_mask.get('year'));
+  func_image = func_image.addBands(forest_mask.select([0], [ee.String('FM_').cat(imageID)]));
+  return func_image;  
+};
+
+
+exports.forestMask_medianPicture = forestMask_medianPicture;
+exports.forestMask_classification = forestMask_classification;
+exports.forestMask_difference = forestMask_difference;
+exports.forestMasks2Image = forestMasks2Image
